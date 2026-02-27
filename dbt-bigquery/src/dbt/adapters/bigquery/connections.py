@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from multiprocessing.context import SpawnContext
+import os
 import re
 import time
 from typing import Dict, Hashable, List, Optional, Tuple, TYPE_CHECKING
@@ -512,18 +513,34 @@ class BigQueryConnectionManager(BaseConnectionManager):
         fallback_timeout: Optional[float] = None,
     ) -> None:
 
-        with self.exception_handler("LOAD TABLE"):
-            with open(file_path, "rb") as f:
-                job = client.load_table_from_file(f, table, rewind=True, job_config=config)
+        # Disable resumable uploads by passing the real file size and temporarily
+        # raising the multipart threshold. By default the Python client uses a
+        # resumable upload when size is unknown OR >= 5 MiB. Passing size alone
+        # fixes the "unknown" case; raising the threshold covers large files.
+        # Equivalent to bq CLI --noenable_resumable_uploads.
+        import google.cloud.bigquery.client as _bq_client
 
-        response = job.result(retry=self._retry.create_retry(fallback=fallback_timeout))
+        file_size = os.path.getsize(file_path)
+        original_max_multipart = _bq_client._MAX_MULTIPART_SIZE
+        _bq_client._MAX_MULTIPART_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB
 
-        if response.state != "DONE":
-            raise DbtDatabaseError("BigQuery Timeout Exceeded")
+        try:
+            with self.exception_handler("LOAD TABLE"):
+                with open(file_path, "rb") as f:
+                    job = client.load_table_from_file(
+                        f, table, rewind=True, size=file_size, job_config=config
+                    )
 
-        elif response.error_result:
-            message = "\n".join(error["message"].strip() for error in response.errors)
-            raise DbtDatabaseError(message)
+            response = job.result(retry=self._retry.create_retry(fallback=fallback_timeout))
+
+            if response.state != "DONE":
+                raise DbtDatabaseError("BigQuery Timeout Exceeded")
+
+            elif response.error_result:
+                message = "\n".join(error["message"].strip() for error in response.errors)
+                raise DbtDatabaseError(message)
+        finally:
+            _bq_client._MAX_MULTIPART_SIZE = original_max_multipart
 
     @staticmethod
     def dataset_ref(database, schema):
